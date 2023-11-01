@@ -11,6 +11,7 @@ class InputEmbeddings(nn.Module):
         self.embedding = nn.Embedding(vocab_size, model_dim)
 
     def forward(self, x):
+        # Apply embedding layer followed by scaling
         x = self.embedding(x)
         x = x * math.sqrt(self.model_dim)
         return x
@@ -23,36 +24,39 @@ class PositionalEncoding(nn.Module):
         self.seq_len = seq_len
         self.dropout = nn.Dropout(dropout)
 
-        # create a matrix of shape (seq_len, model_dim)
-        pe = torch.zeros(seq_len, model_dim)
-        # create a vector of shape (seq_len, 1)
-        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
+        # Create positional encoding for input sequences
+        pe = torch.zeros(seq_len, model_dim)  # (seq_len, model_dim)
+        # Create a vector of shape
+        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)  # (seq_len, 1)
         div_term = torch.exp(torch.arange(0, model_dim, 2).float() * (-math.log(10000) / model_dim))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
 
-        # add batch dimension to pe matrix with a shape (1, seq_len, model_dim)
-        pe = pe.unsqueeze(0)
+        # Add positional encoding and apply dropout
+        pe = pe.unsqueeze(0)  # (1, seq_len, model_dim)
 
         self.register_buffer("pe", pe)
 
     def forward(self, x):
+        # Add positional encoding and apply dropout
         x = x + (self.pe[:, 0 : x.shape[1], :]).requires_grad(False)
         x = self.dropout(x)
         return x
 
 
 class LayerNormalization(nn.Module):
-    def __init__(self, eps: float = 10 ** (-6)):
+    def __init__(self, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.alpha = nn.Parameter(torch.ones(1))
         self.beta = nn.Parameter(torch.ones(1))
 
     def forward(self, x):
+        # Apply layer normalization
         mean = x.mean(dim=-1, keepdim=True)
         std = x.std(dim=-1, keepdim=True)
         x = self.alpha * (x - mean) / (std + self.eps) + self.beta
+        return x
 
 
 class FeedForward(nn.Module):
@@ -65,8 +69,8 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # x has a shape (batch, seq_len, model_dim)
-        x = torch.relu(self.linear_1(x))
+        # Apply feed-forward transformation with ReLU activation and dropout
+        x = torch.relu(self.linear_1(x))  # (batch, seq_len, model_dim)
         x = self.dropout(x)
         x = self.linear_2(x)
         return x
@@ -78,8 +82,8 @@ class MultiHeadAttention(nn.Module):
         self.model_dim = model_dim
         self.head_num = head_num
         assert model_dim % head_num == 0, "model_dim is not divisible by head_num!"
-
         self.submodel_dim = model_dim // head_num
+
         self.query_weight = nn.Linear(model_dim, model_dim)
         self.key_weight = nn.Linear(model_dim, model_dim)
         self.value_weight = nn.Linear(model_dim, model_dim)
@@ -95,8 +99,9 @@ class MultiHeadAttention(nn.Module):
         attention_scores = attention_scores.softmax(dim=-1)  # (batch, head_num, seq_len, seq_len)
         if dropout is not None:
             attention_scores = dropout(attention_scores)
+        output = torch.matmul(attention_scores, value)
 
-        return (attention_scores * value), attention_scores
+        return output, attention_scores
 
     def forward(self, q, k, v, mask):
         query = self.query_weight(q)  # (batch, seq_len, model_dim)
@@ -125,4 +130,21 @@ class ResidualConnection(nn.Module):
         self.norm = LayerNormalization()
 
     def forward(self, x, sublayer):
+        # Apply residual connection with layer normalization and dropout
         x = x + self.dropout(sublayer(self.norm(x)))  # self.norm(sublayer(x)) in the original paper
+        return x
+
+
+class EncoderBlock(nn.Module):
+    def __init__(self, self_attention: MultiHeadAttention, feed_forward: FeedForward, dropout: float):
+        super().__init__()
+        self.self_attention = self_attention
+        self.feed_forward = feed_forward
+        self.residual_connection = nn.ModuleList([ResidualConnection(dropout) for _ in range(2)])
+
+    def forward(self, x, src_mask):
+        self_attention_output = self.residual_connection[0](x, lambda x: self.self_attention(x, x, x, src_mask))
+
+        feed_forward_output = self.residual_connection[1](self_attention_output, lambda x: self.feed_forward(x))
+
+        return feed_forward_output
