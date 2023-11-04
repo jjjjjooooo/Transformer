@@ -2,10 +2,13 @@
     "cSpell.words": [
         "dtype",
         "keepdim",
+        "optim",
         "Projectionlayer",
         "relu",
         "softmax",
         "sublayer",
-        "submodel"
+        "submodel",
+        "tensorboard",
+        "triu"
     ]
 }
