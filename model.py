@@ -12,6 +12,7 @@ class InputEmbeddings(nn.Module):
 
     def forward(self, x):
         # Apply embedding layer followed by scaling
+        # (batch, seq_len) --> (batch, seq_len, model_dim)
         x = self.embedding(x)
         x = x * math.sqrt(self.model_dim)
         return x
@@ -28,7 +29,7 @@ class PositionalEncoding(nn.Module):
         pe = torch.zeros(seq_len, model_dim)  # (seq_len, model_dim)
         # Create a vector of shape
         position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)  # (seq_len, 1)
-        div_term = torch.exp(torch.arange(0, model_dim, 2).float() * (-math.log(10000) / model_dim))
+        div_term = torch.exp(torch.arange(0, model_dim, 2).float() * (-math.log(10000) / model_dim))  # (model_dim / 2)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
 
@@ -53,8 +54,8 @@ class LayerNormalization(nn.Module):
 
     def forward(self, x):
         # Apply layer normalization
-        mean = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True)
+        mean = x.mean(dim=-1, keepdim=True)  # (batch, seq_len, 1)
+        std = x.std(dim=-1, keepdim=True)  # (batch, seq_len, 1)
         x = self.alpha * (x - mean) / (std + self.eps) + self.beta
         return x
 
@@ -70,7 +71,8 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         # Apply feed-forward transformation with ReLU activation and dropout
-        x = torch.relu(self.linear_1(x))  # (batch, seq_len, model_dim)
+        # (batch, seq_len, model_dim) --> (batch, seq_len, d_ff) --> (batch, seq_len, model_dim)
+        x = torch.relu(self.linear_1(x))
         x = self.dropout(x)
         x = self.linear_2(x)
         return x
@@ -90,16 +92,18 @@ class MultiHeadAttention(nn.Module):
         self.output_weight = nn.Linear(model_dim, model_dim)
         self.dropout = nn.Dropout(dropout)
 
-    @staticmethod
-    def attention(query, key, value, mask=None, dropout: nn.Dropout = None):
-        d_k = query.shape[-1]
-        attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
+    def attention(self, query, key, value, mask=None, dropout: nn.Dropout = None):
+        attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(
+            self.submodel_dim
+        )  # (batch, head_num, seq_len, submodel_dim) --> (batch, head_num, seq_len, seq_len)
         if mask is not None:
             attention_scores.masked_fill_(mask == 0, -1e9)
         attention_scores = attention_scores.softmax(dim=-1)  # (batch, head_num, seq_len, seq_len)
         if dropout is not None:
             attention_scores = dropout(attention_scores)
-        output = torch.matmul(attention_scores, value)
+        output = torch.matmul(
+            attention_scores, value
+        )  # (batch, head_num, seq_len, seq_len) --> (batch, head_num, seq_len, submodel_dim)
 
         return output, attention_scores
 
@@ -113,10 +117,12 @@ class MultiHeadAttention(nn.Module):
         key = key.view(key.shape[0], key.shape[1], self.head_num, self.submodel_dim).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.head_num, self.submodel_dim).transpose(1, 2)
 
-        x, self.attention_scores = self.attention(query, key, value, mask, self.dropout)
+        x, self.attention_scores = self.attention(
+            query, key, value, mask, self.dropout
+        )  # (batch, head_num, seq_len, submodel_dim)
         x = (
             x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.head_num * self.submodel_dim)
-        )  # (batch, head_num, seq_len, model_dim)
+        )  # (batch, seq_len, model_dim)
 
         x = self.output_weight(x)
 
@@ -211,43 +217,6 @@ class Projectionlayer(nn.Module):
         return x
 
 
-class Transformer(nn.Module):
-    def __init__(
-        self,
-        encoder: Encoder,
-        decoder: Decoder,
-        src_embed: InputEmbeddings,
-        tgt_embed: InputEmbeddings,
-        src_pos: PositionalEncoding,
-        tgt_pos: PositionalEncoding,
-        projection_layer: Projectionlayer,
-    ):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.src_embed = src_embed
-        self.tgt_embed = tgt_embed
-        self.src_pos = src_pos
-        self.tgt_pos = tgt_pos
-        self.projection_layer = projection_layer
-
-    def encode(self, src, src_mask):
-        src = self.src_embed(src)
-        src = self.src_pos(src)
-        src = self.encoder(src, src_mask)
-        return src
-
-    def decode(self, tgt, encoder_output, src_mask, tgt_mask):
-        tgt = self.tgt_embed(tgt)
-        tgt = self.tgt_pos(tgt)
-        tgt = self.decoder(tgt, encoder_output, src_mask, tgt_mask)
-        return tgt
-
-    def project(self, x):
-        x = self.projection_layer(x)
-        return x
-
-
 def build_transformer(
     src_vocab_size: int,
     tgt_vocab_size: int,
@@ -310,3 +279,40 @@ def build_transformer(
             nn.init.xavier_uniform_(p)
 
     return transformer
+
+
+class Transformer(nn.Module):
+    def __init__(
+        self,
+        encoder: Encoder,
+        decoder: Decoder,
+        src_embed: InputEmbeddings,
+        tgt_embed: InputEmbeddings,
+        src_pos: PositionalEncoding,
+        tgt_pos: PositionalEncoding,
+        projection_layer: Projectionlayer,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embed = src_embed
+        self.tgt_embed = tgt_embed
+        self.src_pos = src_pos
+        self.tgt_pos = tgt_pos
+        self.projection_layer = projection_layer
+
+    def encode(self, src, src_mask):
+        src = self.src_embed(src)
+        src = self.src_pos(src)
+        src = self.encoder(src, src_mask)
+        return src  # (batch, seq_len, model_dim)
+
+    def decode(self, tgt, encoder_output, src_mask, tgt_mask):
+        tgt = self.tgt_embed(tgt)
+        tgt = self.tgt_pos(tgt)
+        tgt = self.decoder(tgt, encoder_output, src_mask, tgt_mask)
+        return tgt  # (batch, seq_len, model_dim)
+
+    def project(self, x):
+        output = self.projection_layer(x)
+        return output  # (batch, seq_len, vocab_size)

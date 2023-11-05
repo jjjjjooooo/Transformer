@@ -8,12 +8,90 @@ from tokenizers.models import WordLevel
 from tokenizers.trainers import WordLevelTrainer
 from tokenizers.pre_tokenizers import Whitespace
 from torch.utils.tensorboard import SummaryWriter
+import torchmetrics
 
 from dataset import BilingualDataset, casual_mask
 from model import build_transformer
 from pathlib import Path
 from config import get_weights_file_path, get_config, latest_weights_file_path
 from tqdm import tqdm
+
+
+def greedy_decode(model, src, src_mask, tokenizer_tgt, config, device):
+    sos_idx = tokenizer_tgt.token_to_id("[SOS]")
+    eos_idx = tokenizer_tgt.token_to_id("[EOS]")
+
+    encoder_output = model.encode(src, src_mask).to(device)
+
+    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(src).to(device)
+
+    while True:
+        if decoder_input.size(1) == config["seq_len"]:
+            break
+
+        decoder_mask = casual_mask(decoder_input.size(1)).type_as(src_mask).to(device)
+
+        decoder_output = model.decode(
+            tgt=decoder_input, encoder_output=encoder_output, src_mask=src_mask, tgt_mask=decoder_mask
+        )
+
+        prob = model.project(decoder_output[:, -1])
+
+        _, next_word_token = torch.max(prob, dim=1)
+
+        decoder_input = torch.cat(
+            [decoder_input, torch.empty(1, 1).type_as(src).fill_(next_word_token.item()).to(device)], dim=1
+        )
+
+        if next_word_token == eos_idx:
+            break
+
+    return decoder_input.squeeze(0)
+
+
+def run_validation(model, validation_ds, tokenizer_tgt, config, device, writer, global_step):
+    model.eval()
+
+    source_texts = []
+    expected = []
+    predicted = []
+
+    with torch.no_grad():
+        for batch in validation_ds:
+            encoder_input = batch["encoder_input"].to(device)  # (batch, seq_len)
+            encoder_mask = batch["encoder_mask"].to(device)  # (batch, 1, 1, seq_len)
+
+            assert encoder_input.size(0) == 1, "Batch size is 1 for validation."
+
+            model_out = greedy_decode(model, encoder_input, encoder_mask, tokenizer_tgt, config, device)
+
+            source_text = batch["src_text"][0]
+            target_text = batch["tgt_text"][0]
+            model_out_text = tokenizer_tgt.decode(model_out.detach().cpu().numpy())
+
+            source_texts.append(source_text)
+            expected.append(target_text)
+            predicted.append(model_out_text)
+
+    if writer:
+        # Evaluate the character error rate
+        # Compute the char error rate
+        metric = torchmetrics.CharErrorRate()
+        cer = metric(predicted, expected)
+        writer.add_scalar("validation cer", cer, global_step)
+        writer.flush()
+
+        # Compute the word error rate
+        metric = torchmetrics.WordErrorRate()
+        wer = metric(predicted, expected)
+        writer.add_scalar("validation wer", wer, global_step)
+        writer.flush()
+
+        # Compute the BLEU metric
+        metric = torchmetrics.BLEUScore()
+        bleu = metric(predicted, expected)
+        writer.add_scalar("validation BLEU", bleu, global_step)
+        writer.flush()
 
 
 def get_all_sentences(dataset, language):
@@ -88,10 +166,12 @@ def train_model(config):
     writer = SummaryWriter(config["experiment_name"])
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], eps=1e-9)
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id("[PAD]"))
+    global_step = 0
 
-    for epoch in tqdm(range(config["num_epochs"])):
-        model.train()
-        for batch in tqdm(train_dataloader):
+    for epoch in range(config["num_epochs"]):
+        for batch in tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}"):
+            model.train()
+
             encoder_input = batch["encoder_input"].to(device)  # (batch_size, seq_len)
             decoder_input = batch["decoder_input"].to(device)  # (batch_size, seq_len)
             encoder_mask = batch["encoder_mask"].to(device)  # (batch_size, 1, 1, seq_len)
@@ -107,16 +187,34 @@ def train_model(config):
             # (batch_size, seq_len, tgt_vocab_size) -> (batch_size * seq_len, tgt_vocab_size)
             loss = loss_fn(projection_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
 
-            writer.add_scalar("train loss", loss.item(), global_step=100)
+            writer.add_scalar("train loss", loss.item(), global_step)
             writer.flush()
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+            global_step += 1
+
+        # Run validation at the end of every epoch
+        run_validation(
+            model,
+            val_dataloader,
+            tokenizer_tgt,
+            config,
+            device,
+            writer,
+        )
+
+        # Save the model at the end of every epoch
         model_filename = get_weights_file_path(config, f"{epoch:02d}")
         torch.save(
-            {"epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict()},
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "global_step": global_step,
+            },
             model_filename,
         )
 
